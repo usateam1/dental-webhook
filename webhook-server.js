@@ -1,151 +1,145 @@
 // ═══════════════════════════════════════════════════════
 //  Minbaev Dental Clinic — Telegram Webhook Server
-//  Одобряет/отклоняет отзывы кнопками прямо в Telegram
 // ═══════════════════════════════════════════════════════
 
 const http = require('http');
+const fs   = require('fs');
 
 const TG_TOKEN = '8348564496:AAE-lfMiKRRPImPPG7bMIWxiPZo9sAvjmC4';
 const TG_CHAT  = '8571455593';
 
-// Хранилище одобренных отзывов (в памяти + файл)
-const fs = require('fs');
-const DB_FILE = './approved.json';
+// ── Файлы-хранилища ──
+function load(file)       { try { return JSON.parse(fs.readFileSync(file,'utf8')); } catch(e){ return []; } }
+function save(file, data) { fs.writeFileSync(file, JSON.stringify(data, null, 2)); }
 
-function loadApproved() {
-  try { return JSON.parse(fs.readFileSync(DB_FILE, 'utf8')); }
-  catch(e) { return []; }
-}
-function saveApproved(list) {
-  fs.writeFileSync(DB_FILE, JSON.stringify(list, null, 2));
-}
-function loadPending() {
-  try { return JSON.parse(fs.readFileSync('./pending.json', 'utf8')); }
-  catch(e) { return []; }
-}
-
-// Ответ на callback_query из Telegram
-async function answerCallback(callbackQueryId, text) {
-  await fetch(`https://api.telegram.org/bot${TG_TOKEN}/answerCallbackQuery`, {
+// ── Telegram helpers ──
+async function tg(method, body) {
+  await fetch(`https://api.telegram.org/bot${TG_TOKEN}/${method}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ callback_query_id: callbackQueryId, text })
+    body: JSON.stringify(body)
   });
 }
 
-// Редактировать сообщение (убрать кнопки после решения)
-async function editMessage(chatId, messageId, text) {
-  await fetch(`https://api.telegram.org/bot${TG_TOKEN}/editMessageText`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      chat_id: chatId,
-      message_id: messageId,
-      text,
-      parse_mode: 'Markdown'
-    })
-  });
-}
-
-// HTTP сервер
-const server = http.createServer(async (req, res) => {
-  // CORS — чтобы сайт мог читать одобренные отзывы
-  res.setHeader('Access-Control-Allow-Origin', '*');
+// ── CORS заголовки (всегда, для любого ответа) ──
+function cors(res) {
+  res.setHeader('Access-Control-Allow-Origin',  '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+}
 
-  if (req.method === 'OPTIONS') { res.writeHead(200); res.end(); return; }
+function json(res, data, code = 200) {
+  cors(res);
+  res.writeHead(code, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify(data));
+}
 
-  // GET /approved — сайт запрашивает список одобренных отзывов
+function readBody(req) {
+  return new Promise(resolve => {
+    let body = '';
+    req.on('data', c => body += c);
+    req.on('end',  () => resolve(body));
+  });
+}
+
+// ── HTTP сервер ──
+http.createServer(async (req, res) => {
+
+  // Preflight CORS
+  if (req.method === 'OPTIONS') { cors(res); res.writeHead(200); res.end(); return; }
+
+  // GET / — health check
+  if (req.method === 'GET' && req.url === '/') {
+    cors(res); res.writeHead(200); res.end('Minbaev Dental Webhook ✅'); return;
+  }
+
+  // GET /approved — список одобренных отзывов для сайта
   if (req.method === 'GET' && req.url === '/approved') {
-    const list = loadApproved();
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify(list));
-    return;
+    return json(res, load('./approved.json'));
   }
 
-  // POST /pending — сайт сохраняет новый отзыв на модерацию
+  // POST /pending — новый отзыв от пациента, сохранить + уведомить в Telegram
   if (req.method === 'POST' && req.url === '/pending') {
-    let body = '';
-    req.on('data', chunk => body += chunk);
-    req.on('end', async () => {
-      try {
-        const review = JSON.parse(body);
-        // Сохранить в pending.json
-        let pending = loadPending();
-        pending.push(review);
-        fs.writeFileSync('./pending.json', JSON.stringify(pending, null, 2));
+    try {
+      const review = JSON.parse(await readBody(req));
 
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: true }));
-      } catch(e) {
-        res.writeHead(500); res.end('error');
-      }
-    });
-    return;
-  }
+      // Сохранить
+      const pending = load('./pending.json');
+      pending.push(review);
+      save('./pending.json', pending);
 
-  // POST /webhook — Telegram присылает нажатие кнопки
-  if (req.method === 'POST' && req.url === '/webhook') {
-    let body = '';
-    req.on('data', chunk => body += chunk);
-    req.on('end', async () => {
-      try {
-        const update = JSON.parse(body);
+      // Уведомление в Telegram с кнопками
+      const stars = '★'.repeat(review.stars) + '☆'.repeat(5 - review.stars);
+      const text  =
+        `⭐ *НОВЫЙ ОТЗЫВ — на модерации*\n` +
+        `━━━━━━━━━━━━━━━━━━\n` +
+        `👤 ${review.name}   ${stars}\n` +
+        `💊 Услуга: ${review.svc || 'не указана'}\n\n` +
+        `📝 _"${review.txt}"_\n` +
+        `━━━━━━━━━━━━━━━━━━\n` +
+        `🆔 ID: \`${review.id}\`\n` +
+        `⏰ ${new Date().toLocaleString('ru-RU')}`;
 
-        if (update.callback_query) {
-          const cb       = update.callback_query;
-          const data     = cb.data;           // "approve_r1234" или "reject_r1234"
-          const msgId    = cb.message.message_id;
-          const chatId   = cb.message.chat.id;
-          const origText = cb.message.text;
-
-          if (data.startsWith('approve_')) {
-            const reviewId = data.replace('approve_', '');
-            // Найти отзыв в pending
-            const pending = loadPending();
-            const review  = pending.find(r => r.id === reviewId);
-
-            if (review) {
-              // Добавить в approved
-              const approved = loadApproved();
-              approved.push({ ...review, status: 'approved', approvedAt: Date.now() });
-              saveApproved(approved);
-
-              await answerCallback(cb.id, '✅ Отзыв одобрен и опубликован!');
-              await editMessage(chatId, msgId,
-                `${origText}\n\n✅ *ОДОБРЕНО* — опубликовано на сайте`
-              );
-            } else {
-              await answerCallback(cb.id, '⚠️ Отзыв не найден');
-            }
-
-          } else if (data.startsWith('reject_')) {
-            const reviewId = data.replace('reject_', '');
-            await answerCallback(cb.id, '❌ Отзыв отклонён');
-            await editMessage(chatId, msgId,
-              `${origText}\n\n❌ *ОТКЛОНЕНО*`
-            );
-          }
+      await tg('sendMessage', {
+        chat_id: TG_CHAT,
+        text,
+        parse_mode: 'Markdown',
+        reply_markup: {
+          inline_keyboard: [[
+            { text: '✅ Одобрить', callback_data: `approve_${review.id}` },
+            { text: '❌ Отклонить', callback_data: `reject_${review.id}` }
+          ]]
         }
+      });
 
-        res.writeHead(200); res.end('ok');
-      } catch(e) {
-        console.error(e);
-        res.writeHead(500); res.end('error');
+      return json(res, { ok: true });
+    } catch(e) {
+      console.error(e);
+      return json(res, { ok: false }, 500);
+    }
+  }
+
+  // POST /webhook — Telegram нажал кнопку
+  if (req.method === 'POST' && req.url === '/webhook') {
+    try {
+      const update = JSON.parse(await readBody(req));
+
+      if (update.callback_query) {
+        const cb      = update.callback_query;
+        const data    = cb.data;
+        const msgId   = cb.message.message_id;
+        const chatId  = cb.message.chat.id;
+        const origTxt = cb.message.text;
+
+        if (data.startsWith('approve_')) {
+          const id      = data.replace('approve_', '');
+          const pending = load('./pending.json');
+          const review  = pending.find(r => r.id === id);
+
+          if (review) {
+            const approved = load('./approved.json');
+            approved.push({ ...review, status: 'approved', approvedAt: Date.now() });
+            save('./approved.json', approved);
+            await tg('answerCallbackQuery', { callback_query_id: cb.id, text: '✅ Опубликовано!' });
+            await tg('editMessageText', { chat_id: chatId, message_id: msgId, text: origTxt + '\n\n✅ *ОДОБРЕНО* — опубликовано на сайте', parse_mode: 'Markdown' });
+          } else {
+            await tg('answerCallbackQuery', { callback_query_id: cb.id, text: '⚠️ Не найден' });
+          }
+
+        } else if (data.startsWith('reject_')) {
+          await tg('answerCallbackQuery', { callback_query_id: cb.id, text: '❌ Отклонено' });
+          await tg('editMessageText', { chat_id: chatId, message_id: msgId, text: origTxt + '\n\n❌ *ОТКЛОНЕНО*', parse_mode: 'Markdown' });
+        }
       }
-    });
+
+      cors(res); res.writeHead(200); res.end('ok');
+    } catch(e) {
+      console.error(e);
+      cors(res); res.writeHead(500); res.end('error');
+    }
     return;
   }
 
-  // Health check
-  if (req.url === '/') {
-    res.writeHead(200); res.end('Minbaev Dental Webhook — работает ✅');
-    return;
-  }
+  cors(res); res.writeHead(404); res.end('not found');
 
-  res.writeHead(404); res.end('not found');
-});
-
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`✅ Сервер запущен на порту ${PORT}`));
+}).listen(process.env.PORT || 3000, () => console.log('✅ Webhook сервер запущен'));
