@@ -58,6 +58,54 @@ http.createServer(async (req, res) => {
     return json(res, load('./approved.json'));
   }
 
+  // GET /pending — список отзывов на модерации (для админки)
+  if (req.method === 'GET' && req.url === '/pending') {
+    return json(res, load('./pending.json'));
+  }
+
+  // POST /approve — одобрить отзыв из админки
+  if (req.method === 'POST' && req.url === '/approve') {
+    let body = '';
+    req.on('data', chunk => body += chunk);
+    req.on('end', async () => {
+      try {
+        const { id, adminPass } = JSON.parse(body);
+        if (adminPass !== 'minbaev2024') return json(res, { ok:false, error:'Неверный пароль' }, 403);
+        const pending  = load('./pending.json');
+        const review   = pending.find(r => r.id === id);
+        if (!review) return json(res, { ok:false, error:'Не найден' }, 404);
+        const approved = load('./approved.json');
+        approved.push({ ...review, status:'approved', approvedAt: Date.now() });
+        save('./approved.json', approved);
+        save('./pending.json', pending.filter(r => r.id !== id));
+        return json(res, { ok: true });
+      } catch(e) { return json(res, { ok:false }, 500); }
+    });
+    return;
+  }
+
+  // DELETE /approved — удалить отзыв по id
+  if (req.method === 'POST' && req.url === '/delete') {
+    let body = '';
+    req.on('data', chunk => body += chunk);
+    req.on('end', async () => {
+      try {
+        const { id, adminPass } = JSON.parse(body);
+        // Простая защита паролем
+        if (adminPass !== 'minbaev2024') {
+          return json(res, { ok: false, error: 'Неверный пароль' }, 403);
+        }
+        const approved = load('./approved.json');
+        const filtered = approved.filter(r => r.id !== id);
+        save('./approved.json', filtered);
+        return json(res, { ok: true, deleted: approved.length - filtered.length });
+      } catch(e) {
+        return json(res, { ok: false }, 500);
+      }
+    });
+    return;
+  }
+
   // POST /pending — новый отзыв от пациента, сохранить + уведомить в Telegram
   if (req.method === 'POST' && req.url === '/pending') {
     try {
